@@ -100,18 +100,27 @@ cargo fmt --check
 
 ## Releasing
 
-The version lives in `Cargo.toml` and nowhere else — `conda.recipe/recipe.yaml`
-reads it with `load_from_file`, and the tag is derived from it. To publish:
+The conda package is **not** built here. It is built and published by
+[blooop/blooop-feedstock](https://github.com/blooop/blooop-feedstock), which owns
+the recipe (`recipes/claude-statusline/recipe.yaml`) and the `prefix.dev`
+credentials for the `blooop` channel. This repo only produces the tag the recipe
+fetches its source from:
 
 ```bash
 # bump [package] version in Cargo.toml, commit, then:
 git tag v0.1.0 && git push origin v0.1.0
 ```
 
-The tag push triggers `.github/workflows/conda-publish.yml`, which builds the
-recipe with rattler-build and uploads to `https://prefix.dev/blooop` with the
-`PIXI_TOKEN` secret. The recipe fetches its source *from that tag*, which is why
-the tag has to exist before the build rather than after it.
+Then, in the feedstock, bump `version` and the source `sha256` in the recipe and
+run its release workflow:
+
+```bash
+gh workflow run release-workflow.yml --repo blooop/blooop-feedstock \
+  -f package=claude-statusline -f force_build=true
+```
+
+The tag has to exist before the feedstock build, because the recipe fetches the
+tag's source tarball by URL and checksum.
 
 ## Licence
 
