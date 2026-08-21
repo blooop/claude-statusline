@@ -1,0 +1,23 @@
+{
+  "model": {
+    "display_name": "Claude Fable 1"
+  },
+  "context_window": {
+    "total_input_tokens": 99000,
+    "context_window_size": 200000
+  },
+  "cost": {
+    "total_cost_usd": 12.5,
+    "total_duration_ms": 3600000
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 99.6,
+      "resets_at": 1787341326.2422588
+    },
+    "seven_day": {
+      "used_percentage": 44.0,
+      "resets_at": 1787541725.7422588
+    }
+  }
+}

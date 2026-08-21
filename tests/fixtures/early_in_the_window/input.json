@@ -1,0 +1,23 @@
+{
+  "model": {
+    "display_name": "Claude Haiku 4.5"
+  },
+  "context_window": {
+    "total_input_tokens": 8100,
+    "context_window_size": 200000
+  },
+  "cost": {
+    "total_cost_usd": 0.0037,
+    "total_duration_ms": 42000
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 8.0,
+      "resets_at": 1787358725.7093396
+    },
+    "seven_day": {
+      "used_percentage": 2.0,
+      "resets_at": 1787935325.7093396
+    }
+  }
+}

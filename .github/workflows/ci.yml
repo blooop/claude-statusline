@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  # No `branches:` filter here on purpose: that filter matches a pull request's
+  # *base*, so pinning it to main exempts every link but the last of a stacked
+  # chain from being gated at all.
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install the toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+      # The golden fixtures are recordings of the Python original's stdout, so
+      # they gate the port on their own and need no interpreter. The live parity
+      # test in `tests/parity.rs` skips itself when `STATUS_LINE_PY` is unset,
+      # which is the case here — the script lives on the author's machine, not
+      # in this repo.
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Build the release binary
+        run: cargo build --locked --release
+
+      - name: Smoke-test the release binary
+        run: |
+          set -euo pipefail
+          echo '{}' | ./target/release/claude-statusline | grep -q '5h'
+          printf '' | ./target/release/claude-statusline | grep -q '⏳'

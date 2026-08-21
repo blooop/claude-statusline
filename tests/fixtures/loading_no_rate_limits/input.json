@@ -1,0 +1,16 @@
+{
+  "model": {
+    "display_name": "Claude Sonnet 4.6"
+  },
+  "context_window": {
+    "total_input_tokens": 0,
+    "context_window_size": 200000
+  },
+  "cost": {
+    "total_cost_usd": 0,
+    "total_duration_ms": 0,
+    "total_lines_added": 0,
+    "total_lines_removed": 0
+  },
+  "rate_limits": {}
+}

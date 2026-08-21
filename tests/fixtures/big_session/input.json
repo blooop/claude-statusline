@@ -1,0 +1,15 @@
+{
+  "model": {
+    "display_name": "Opus 5"
+  },
+  "context_window": {
+    "total_input_tokens": 1234567,
+    "context_window_size": 2000000
+  },
+  "cost": {
+    "total_cost_usd": 123.456,
+    "total_duration_ms": 7845000,
+    "total_lines_added": 10.0,
+    "total_lines_removed": 0
+  }
+}

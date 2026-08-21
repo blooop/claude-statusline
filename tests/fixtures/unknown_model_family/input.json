@@ -1,0 +1,9 @@
+{
+  "model": {
+    "display_name": "Some Other Model"
+  },
+  "context_window": {
+    "total_input_tokens": 45678,
+    "context_window_size": 200000
+  }
+}

@@ -1,0 +1,13 @@
+{
+  "model": {
+    "display_name": "Claude Haiku 4.5"
+  },
+  "context_window": {
+    "total_input_tokens": 500,
+    "context_window_size": 200000
+  },
+  "cost": {
+    "total_lines_added": 0,
+    "total_lines_removed": 17
+  }
+}

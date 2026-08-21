@@ -1,0 +1,25 @@
+{
+  "model": {
+    "display_name": "Claude Sonnet 4.6"
+  },
+  "context_window": {
+    "total_input_tokens": 152000,
+    "context_window_size": 200000
+  },
+  "cost": {
+    "total_cost_usd": 41.9,
+    "total_duration_ms": 9845000,
+    "total_lines_added": 1204,
+    "total_lines_removed": 903
+  },
+  "rate_limits": {
+    "five_hour": {
+      "used_percentage": 137.2,
+      "resets_at": 1787343125.6842475
+    },
+    "seven_day": {
+      "used_percentage": 91.0,
+      "resets_at": 1787626925.6842475
+    }
+  }
+}
