@@ -4,6 +4,16 @@ One binary that renders [Claude Code](https://claude.com/claude-code)'s status
 line. It reads the status-line JSON payload on stdin and prints a single
 ANSI-coloured line:
 
+![The status line, rendered](docs/screenshot-opus.png)
+
+Another session, on a different model — 5h running hot at 88% against an even
+burn of 54%, 7d banking it at 13%, and no diff block because nothing has been
+edited yet:
+
+![The same line on Fable 5.1](docs/screenshot-fable.png)
+
+Which segment is which:
+
 ```
 Opus 5 (1M context)│45.7k/200k│🐢22%/48% ⏳2h35m/5h│🔥63%/53% ⏳3d7h/7d│$3.42│30m45s│+271/-88
 └─ model ──────────┘└ context ┘└─ 5h window ──────┘└─ 7d window ──────┘└cost┘└ time ┘└ diff ┘
