@@ -34,6 +34,7 @@
 use serde_json::Value;
 
 pub mod civil;
+pub mod pr;
 
 // ---------------------------------------------------------------------------
 // Palette
@@ -54,6 +55,16 @@ const SEP: &str = c!(243);
 const COST: &str = c!(79);
 /// steel blue — session wall-clock
 const DUR: &str = c!(68);
+
+/// One hue and one glyph per pull-request state. The glyph is doing the work
+/// the hue only reinforces: `●` and `◆` are as different to a monochrome
+/// terminal, or to a red-green eye, as green and purple are to everything else.
+/// Draft is the only hollow one, because it is the only state that is not yet a
+/// thing that exists.
+const PR_OPEN: (&str, &str) = (c!(41), "●");
+const PR_DRAFT: (&str, &str) = (c!(102), "○");
+const PR_MERGED: (&str, &str) = (c!(99), "◆");
+const PR_CLOSED: (&str, &str) = (c!(160), "✕");
 const RED: &str = "\x1b[31m";
 const GREEN: &str = "\x1b[32m";
 const RESET: &str = "\x1b[0m";
@@ -509,6 +520,35 @@ fn window_part(label: &str, window_len: f64, sub: Option<&Value>, now: f64) -> S
     )
 }
 
+/// The PR segment: the full URL, glyphed and hued by state, and also an OSC 8
+/// hyperlink pointing at itself.
+///
+/// The URL is printed in full rather than as a tidy `#11573` because the two
+/// ways a terminal opens a link do not look at the same thing. OSC 8 —
+/// `ESC ] 8 ;; <url> ESC \\`, the text, then the same with an empty url to
+/// close it — hands the target to the terminal out of band, which is what a
+/// ctrl-click follows. Keyboard URL pickers do not read it: kitty's hints
+/// kitten (`ctrl+shift+e`), and every tmux and Vim equivalent, scan the visible
+/// *text* for something matching a URL. A `#11573` offers them nothing to
+/// match, so the link was reachable only by mouse.
+///
+/// Printing the URL serves both, which is why the segment moved to the end of
+/// the line: it is ~55 columns, and last is where the line is already designed
+/// to give way. Being last also keeps the match clean — nothing follows the URL
+/// for a greedy pattern to swallow.
+fn pr_part(pr: &pr::Pr) -> String {
+    let (color, glyph) = match pr.state {
+        pr::State::Open => PR_OPEN,
+        pr::State::Draft => PR_DRAFT,
+        pr::State::Merged => PR_MERGED,
+        pr::State::Closed => PR_CLOSED,
+    };
+    format!(
+        "\x1b]8;;{0}\x1b\\{color}{glyph}{0}{RESET}\x1b]8;;\x1b\\",
+        pr.url
+    )
+}
+
 /// What the process should do with an input.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Render {
@@ -520,8 +560,12 @@ pub enum Render {
 
 /// Render one status line from a stdin payload.
 ///
-/// `now` is epoch seconds, injected so the golden tests can pin it.
-pub fn render(input: &[u8], now: f64) -> Render {
+/// `now` is epoch seconds, injected so the golden tests can pin it. `pr` is
+/// passed in rather than looked up, for the same reason: it is the one part of
+/// the line that comes from outside the payload, and keeping the lookup in
+/// `main` leaves this a pure function of its arguments. `None` — no repo, no
+/// PR, or nothing cached yet — renders no segment rather than a placeholder.
+pub fn render(input: &[u8], now: f64, pr: Option<&pr::Pr>) -> Render {
     let data: Value = match std::str::from_utf8(input)
         .ok()
         .and_then(|s| serde_json::from_str(s).ok())
@@ -575,6 +619,11 @@ pub fn render(input: &[u8], now: f64) -> Render {
         let a = added.map(py_num_str).unwrap_or_else(|| "0".into());
         let r = removed.map(py_num_str).unwrap_or_else(|| "0".into());
         parts.push(format!("{GREEN}+{a}{RESET}/{RED}-{r}{RESET}"));
+    }
+    // Last, and after the session metrics: it is the longest thing on the line
+    // by some way, and a keyboard URL picker wants it with nothing after it.
+    if let Some(pr) = pr {
+        parts.push(pr_part(pr));
     }
 
     Render::Line(parts.join(&format!("{SEP}│{RESET}")))
@@ -700,10 +749,10 @@ mod tests {
     #[test]
     fn a_non_object_payload_is_a_crash_not_a_line() {
         assert_eq!(
-            render(b"[]", 0.0),
+            render(b"[]", 0.0, None),
             Render::Crash("status line payload is not a JSON object")
         );
-        assert_eq!(render(b"", 0.0), Render::Line("\u{23f3}".into()));
-        assert_eq!(render(b"nope", 0.0), Render::Line("\u{23f3}".into()));
+        assert_eq!(render(b"", 0.0, None), Render::Line("\u{23f3}".into()));
+        assert_eq!(render(b"nope", 0.0, None), Render::Line("\u{23f3}".into()));
     }
 }

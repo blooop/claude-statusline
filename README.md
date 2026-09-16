@@ -15,9 +15,12 @@ edited yet:
 Which segment is which:
 
 ```
-Opus 5 (1M context)│45.7k/200k│🐢22%/48% ⏳2h35m/5h│🔥63%/53% ⏳3d7h/7d│$3.42│30m45s│+271/-88
-└─ model ──────────┘└ context ┘└─ 5h window ──────┘└─ 7d window ──────┘└cost┘└ time ┘└ diff ┘
+Opus 5 (1M context)│45.7k/200k│🐢22%/48% ⏳2h35m/5h│$3.42│30m45s│+271/-88│●https://github.com/o/r/pull/11573
+└─ model ──────────┘└ context ┘└─ 5h window ──────┘└cost┘└ time ┘└ diff ┘└─ pull request ─────────────────┘
 ```
+
+(the 7d window is dropped from that sketch for width; on a real line it follows
+the 5h one.) The pull request is only there when the branch has one.
 
 It is a **faithful port** of the stdlib-Python `status-line.py` it replaces —
 same output, byte for byte, for the same stdin. The port exists because a Python
@@ -63,13 +66,59 @@ Code's `statusLine` at it in `~/.claude/settings.json`:
   sustainable rate and fully red. Absolute usage is printed but never hued: an
   even burn projects to 100 at any level, so the number tells you the level and
   the hue tells you the rate.
-* **Session** — cost, wall-clock and lines added/removed come last, so a narrow
-  terminal clips them first.
+* **Session** — cost, wall-clock and lines added/removed, so a narrow terminal
+  clips them before anything load-bearing.
+* **Pull request** — the PR for the branch this session's directory is on. `●`
+  open, `○` draft, `◆` merged, `✕` closed: the glyph carries the state and the
+  hue only reinforces it, so it still reads on a monochrome terminal or to a
+  red-green eye. Absent when the branch has no PR.
+
+  It is printed as a full URL, and it is also an
+  [OSC 8](https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda)
+  hyperlink pointing at itself, because the two ways a terminal opens a link do
+  not look at the same thing. OSC 8 hands the target to the terminal out of
+  band — that is what a ctrl-click follows. Keyboard URL pickers never read it:
+  kitty's hints kitten (`ctrl+shift+e`), and the tmux and Vim equivalents, scan
+  the visible *text* for something shaped like a URL. A tidy `#11573` gives them
+  nothing to match, which leaves the link reachable by mouse only.
+
+  Printing the URL serves both, and that is why this goes last: ~55 columns is
+  the widest thing on the line, the end is where the line is already designed to
+  give way, and nothing following the URL means nothing for a greedy match to
+  swallow.
 
 A window with no data yet reads `⏳5h --` in grey. A window with usage but no
 reset clock drops the pacing pair and colours by absolute usage instead, because
 there is no second term to compare against. Nothing on stdin, or unparseable
 JSON, prints a bare `⏳`.
+
+## Where the PR number comes from
+
+Everything else on the line is in the payload on stdin. A PR number is not, and
+`gh pr list` is ~450ms against a warm cache — per render, on every message. So
+the lookup is never on the render path:
+
+* **`.git/HEAD` and `.git/config` are read directly**, not via `git rev-parse`.
+  Two file reads instead of two fork+execs, and it makes the cache key
+  `(repo, branch)` rather than `(directory)` — switch branch and the line
+  follows on the next render instead of waiting out a TTL. Worktrees are
+  handled: `dl` gives every branch its own checkout, and agents work in
+  `git worktree` trees where `.git` is a file and the config lives elsewhere.
+* **The answer lives in `~/.cache/claude-statusline/`.** A render reads it and
+  prints it. If it is older than 30s the render *also* spawns a detached copy of
+  this binary to fetch a new one, for next time, behind a lock so two renders a
+  millisecond apart cannot both spawn.
+* **A `gh` that fails changes nothing.** No auth, no network, not a GitHub
+  remote — the previous answer stays up and the lock's expiry paces the retries.
+  Only a successful call may erase a known PR, because losing the link on a blip
+  is worse than showing one a minute old.
+* **Nothing cached yet shows no segment**, not a spinner or a placeholder. "Not
+  asked yet" resolves itself within a second, and until it does it should look
+  like what it will probably turn out to be: a branch with no PR.
+
+A merged PR still shows, because the branch outlives the merge and the link
+stays worth having. A detached HEAD shows nothing: no branch, no PR, and a raw
+sha in the line is only noise.
 
 ## Fidelity
 
@@ -89,10 +138,18 @@ The port is held to the original by two test layers:
   STATUS_LINE_PY=~/.claude/scripts/status-line.py cargo test --test parity
   ```
 
-`CLAUDE_STATUSLINE_NOW` (epoch seconds) is the only environment variable the
-binary reads, and it exists for those tests: `resets_at` only means anything
-relative to "now", so a fixture exercising a mid-window block has to pin the
-instant it was recorded at.
+The PR segment is the one thing on the line the Python script never printed, so
+it sits outside that contract by construction: no fixture names a working
+directory, so no fixture grows a link, and both layers still hold byte for byte.
+
+Environment variables, all four of them:
+
+| | |
+|---|---|
+| `CLAUDE_STATUSLINE_NOW` | epoch seconds, for the tests — `resets_at` only means anything relative to "now", so a fixture exercising a mid-window block has to pin the instant it was recorded at |
+| `CLAUDE_STATUSLINE_NO_PR` | set to anything to drop the PR segment and the lookup behind it |
+| `CLAUDE_STATUSLINE_PR_TTL` | seconds before a cached PR is refreshed (default 30) |
+| `CLAUDE_STATUSLINE_CACHE` | where the PR cache lives (default `$XDG_CACHE_HOME`, else `~/.cache`) |
 
 Two behaviours are worth naming because they are inherited rather than designed:
 a top-level JSON value that is not an object prints nothing and exits 1 (Python
