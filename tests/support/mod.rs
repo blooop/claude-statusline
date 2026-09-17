@@ -77,6 +77,17 @@ pub fn run_binary(input: &[u8], now: Option<f64>) -> Output {
     feed(cmd, input)
 }
 
+/// Run the built binary with extra environment, for the tests that need to
+/// point it at a scratch cache and a stub `gh`.
+pub fn run_binary_env(input: &[u8], envs: &[(&str, &str)]) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_claude-statusline"));
+    cmd.env_remove("CLAUDE_STATUSLINE_NOW");
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    feed(cmd, input)
+}
+
 /// Run the Python original.
 pub fn run_python(script: &str, input: &[u8]) -> Output {
     let mut cmd = Command::new("python3");
