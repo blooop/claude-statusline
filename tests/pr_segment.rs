@@ -198,7 +198,7 @@ fn the_first_render_is_empty_and_the_refresh_it_starts_fills_the_second() {
         text.contains(PR_URL),
         "the URL must be on screen, not just in the escape: {text:?}"
     );
-    assert!(text.contains(&format!("●{PR_URL}")), "open PR: {text:?}");
+    assert!(text.contains(&format!("● {PR_URL}")), "open PR: {text:?}");
 
     // Last on the line, with nothing after it for a greedy match to swallow.
     assert!(text.ends_with(PR_URL), "the PR goes last: {text:?}");
