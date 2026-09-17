@@ -544,7 +544,7 @@ fn pr_part(pr: &pr::Pr) -> String {
         pr::State::Closed => PR_CLOSED,
     };
     format!(
-        "\x1b]8;;{0}\x1b\\{color}{glyph}{0}{RESET}\x1b]8;;\x1b\\",
+        "\x1b]8;;{0}\x1b\\{color}{glyph} {0}{RESET}\x1b]8;;\x1b\\",
         pr.url
     )
 }

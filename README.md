@@ -15,7 +15,7 @@ edited yet:
 Which segment is which:
 
 ```
-Opus 5 (1M context)│45.7k/200k│🐢22%/48% ⏳2h35m/5h│$3.42│30m45s│+271/-88│●https://github.com/o/r/pull/11573
+Opus 5 (1M context)│45.7k/200k│🐢22%/48% ⏳2h35m/5h│$3.42│30m45s│+271/-88│● https://github.com/o/r/pull/11573
 └─ model ──────────┘└ context ┘└─ 5h window ──────┘└cost┘└ time ┘└ diff ┘└─ pull request ─────────────────┘
 ```
 
