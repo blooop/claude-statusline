@@ -144,8 +144,8 @@ stays worth having. A detached HEAD shows nothing: no branch, no PR, and a raw
 sha in the line is only noise.
 
 The checkout is the session's `workspace.current_dir` — where Claude Code was
-started, not wherever a shell later `cd`'d to. Start it at the root of the
-checkout whose PR you want on the line.
+started, not wherever a shell later `cd`'d to. Start it inside the checkout
+whose PR you want on the line.
 
 ## Fidelity
 
