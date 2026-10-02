@@ -45,6 +45,9 @@ const LOCK_STALE: Duration = Duration::from_secs(60);
 /// The argv[1] that puts this binary in refresh mode. Not a documented
 /// interface: the only thing that passes it is [`spawn_refresh`] below.
 pub const REFRESH_FLAG: &str = "--refresh-pr";
+/// How many same-named heads one `gh pr list` asks for. A page this full with
+/// none of them ours may have cut ours off, so it is no answer at all.
+const PAGE: usize = 20;
 
 // ---------------------------------------------------------------------------
 // What we found
@@ -251,7 +254,7 @@ pub fn refresh(slug: &str, head_owner: &str, branch: &str) {
             "--state",
             "all",
             "--limit",
-            "20",
+            &PAGE.to_string(),
             "--json",
             "number,url,state,isDraft,headRepositoryOwner",
         ])
@@ -264,21 +267,24 @@ pub fn refresh(slug: &str, head_owner: &str, branch: &str) {
     // retries. Only a successful call is allowed to erase a known PR.
     if let Ok(out) = out {
         if out.status.success() {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
+            if let Some(json) = first_pr_json(&out.stdout, head_owner) {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&path, json);
             }
-            let _ = fs::write(&path, first_pr_json(&out.stdout, head_owner));
         }
     }
     let _ = fs::remove_file(path.with_extension("lock"));
 }
 
-/// The first PR in `gh`'s array whose head is `head_owner`'s, else `null`.
+/// The first PR in `gh`'s array whose head is `head_owner`'s, else `null` —
+/// or `None` when a full [`PAGE`] held none of ours, and so settles nothing.
 ///
 /// Stored as `gh` shaped it rather than re-encoded, so the cache file is
 /// readable and the parse below has one shape to handle. GitHub logins are
 /// case-insensitive, and a remote URL need not spell one as GitHub does.
-fn first_pr_json(stdout: &[u8], head_owner: &str) -> Vec<u8> {
+fn first_pr_json(stdout: &[u8], head_owner: &str) -> Option<Vec<u8>> {
     let parsed: Option<Value> = serde_json::from_slice(stdout).ok();
     let ours = |pr: &&Value| {
         pr.get("headRepositoryOwner")
@@ -286,13 +292,11 @@ fn first_pr_json(stdout: &[u8], head_owner: &str) -> Vec<u8> {
             .and_then(Value::as_str)
             .is_some_and(|login| login.eq_ignore_ascii_case(head_owner))
     };
-    match parsed
-        .as_ref()
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.iter().find(ours))
-    {
-        Some(pr) => serde_json::to_vec(pr).unwrap_or_else(|_| b"null".to_vec()),
-        None => b"null".to_vec(),
+    let rows = parsed.as_ref().and_then(|v| v.as_array());
+    match rows.and_then(|a| a.iter().find(ours)) {
+        Some(pr) => Some(serde_json::to_vec(pr).unwrap_or_else(|_| b"null".to_vec())),
+        None if rows.is_some_and(|a| a.len() >= PAGE) => None,
+        None => Some(b"null".to_vec()),
     }
 }
 
@@ -665,23 +669,34 @@ mod tests {
     #[test]
     fn gh_output_reduces_to_the_first_pr_or_null() {
         let one = br#"[{"isDraft":false,"number":11573,"state":"OPEN","url":"https://github.com/o/r/pull/11573","headRepositoryOwner":{"login":"o"}}]"#;
-        let pr = parse_cache(&first_pr_json(one, "o")).expect("a pr");
+        let pr = parse_cache(&first_pr_json(one, "o").expect("an answer")).expect("a pr");
         assert_eq!(pr.number, 11573);
         assert_eq!(pr.state, State::Open);
         assert_eq!(pr.url, "https://github.com/o/r/pull/11573");
 
-        assert_eq!(first_pr_json(b"[]", "o"), b"null");
+        assert_eq!(first_pr_json(b"[]", "o").as_deref(), Some(&b"null"[..]));
         // someone else's head is not ours, and neither is a head with no owner
-        assert_eq!(first_pr_json(one, "fork"), b"null");
+        assert_eq!(first_pr_json(one, "fork").as_deref(), Some(&b"null"[..]));
         assert_eq!(
-            first_pr_json(br#"[{"number":1,"url":"https://x/1"}]"#, "o"),
-            b"null"
+            first_pr_json(br#"[{"number":1,"url":"https://x/1"}]"#, "o").as_deref(),
+            Some(&b"null"[..])
+        );
+        // a full page of other owners' heads may have cut ours off
+        let full = format!("[{}]", vec![r#"{"number":1}"#; PAGE].join(","));
+        assert_eq!(first_pr_json(full.as_bytes(), "o"), None);
+        let short = format!("[{}]", vec![r#"{"number":1}"#; PAGE - 1].join(","));
+        assert_eq!(
+            first_pr_json(short.as_bytes(), "o").as_deref(),
+            Some(&b"null"[..])
         );
         assert_eq!(parse_cache(b"null"), None);
         // a half-written or truncated cache is nothing, never a panic
         assert_eq!(parse_cache(b""), None);
         assert_eq!(parse_cache(br#"{"number":1}"#), None);
-        assert_eq!(first_pr_json(b"not json", "o"), b"null");
+        assert_eq!(
+            first_pr_json(b"not json", "o").as_deref(),
+            Some(&b"null"[..])
+        );
     }
 
     #[test]

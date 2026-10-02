@@ -299,6 +299,58 @@ fn a_gh_that_fails_leaves_the_last_good_answer_standing() {
 }
 
 #[test]
+fn a_full_page_of_other_owners_prs_leaves_the_last_good_answer_standing() {
+    // `--head` matches by name alone, so a popular branch name can fill the
+    // whole `--limit` with forks' PRs and push ours off the page. That page
+    // says nothing about our PR, so it must not erase the one we know.
+    let scratch = Scratch::new("full-page");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let cache = scratch.path().join("cache");
+    let cache_s = cache.to_str().unwrap().to_string();
+    let good = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let input = payload(&work);
+    let primed = render_until_pr(
+        &input,
+        &[
+            ("PATH", good.to_str().unwrap()),
+            ("CLAUDE_STATUSLINE_CACHE", &cache_s),
+        ],
+        Duration::from_secs(10),
+    );
+    assert!(primed.contains(PR_URL), "primed: {primed:?}");
+
+    let rows: Vec<String> = (1..=20)
+        .map(|n| {
+            format!(
+                r#"{{"number":{n},"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/{n}","state":"OPEN","isDraft":false,"headRepositoryOwner":{{"login":"fork{n}"}}}}"#
+            )
+        })
+        .collect();
+    let crowded = plant_gh(scratch.path(), &format!("[{}]", rows.join(",")), 0);
+    let envs = [
+        ("PATH", crowded.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", &cache_s[..]),
+        ("CLAUDE_STATUSLINE_PR_TTL", "0"),
+    ];
+    let line = String::from_utf8_lossy(&run_binary_env(&input, &envs).stdout).into_owned();
+    assert!(line.contains(PR_URL), "stale but still linked: {line:?}");
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        fs::read_to_string(cache_entry(&cache))
+            .unwrap()
+            .contains("11573"),
+        "a page with no room for our PR must not overwrite it"
+    );
+    let again = String::from_utf8_lossy(&run_binary_env(&input, &envs).stdout).into_owned();
+    assert!(again.contains(PR_URL), "still linked: {again:?}");
+}
+
+#[test]
 fn a_directory_that_is_not_a_checkout_asks_nothing_and_shows_nothing() {
     let scratch = Scratch::new("norepo");
     let plain = scratch.path().join("plain");
