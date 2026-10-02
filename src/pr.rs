@@ -91,6 +91,26 @@ pub struct Checkout {
     pub branch: String,
 }
 
+impl Checkout {
+    /// The refresh child's argv after [`REFRESH_FLAG`]. [`Checkout::from_args`]
+    /// reads it back, and the order lives only in these two functions.
+    pub fn to_args(&self) -> [&str; 3] {
+        [&self.slug, &self.head_owner, &self.branch]
+    }
+
+    /// The inverse of [`Checkout::to_args`]; any other arity is not ours.
+    pub fn from_args(args: &[String]) -> Option<Checkout> {
+        match args {
+            [slug, head_owner, branch] => Some(Checkout {
+                slug: slug.clone(),
+                head_owner: head_owner.clone(),
+                branch: branch.clone(),
+            }),
+            _ => None,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The hot path
 // ---------------------------------------------------------------------------
@@ -216,9 +236,7 @@ fn spawn_refresh(checkout: &Checkout, cache: &Path) {
     // the prompt the status line is drawn in.
     let spawned = Command::new(exe)
         .arg(REFRESH_FLAG)
-        .arg(&checkout.slug)
-        .arg(&checkout.head_owner)
-        .arg(&checkout.branch)
+        .args(checkout.to_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -233,13 +251,13 @@ fn spawn_refresh(checkout: &Checkout, cache: &Path) {
 // ---------------------------------------------------------------------------
 
 /// Ask GitHub, write the answer, drop the lock. Runs in the spawned child.
-pub fn refresh(slug: &str, head_owner: &str, branch: &str) {
-    let checkout = Checkout {
-        slug: slug.to_string(),
-        head_owner: head_owner.to_string(),
-        branch: branch.to_string(),
-    };
-    let Some(path) = cache_path(&checkout) else {
+pub fn refresh(checkout: &Checkout) {
+    let Checkout {
+        slug,
+        head_owner,
+        branch,
+    } = checkout;
+    let Some(path) = cache_path(checkout) else {
         return;
     };
     // `--state all`, because a merged PR is still the answer to "what is this
@@ -709,6 +727,21 @@ mod tests {
         assert!(!is_safe_url("javascript:alert(1)"));
         assert!(!is_safe_url(""));
         assert!(!is_safe_url(&format!("https://x/{}", "a".repeat(600))));
+    }
+
+    #[test]
+    fn a_checkout_survives_the_trip_through_the_refresh_argv() {
+        let c = Checkout {
+            slug: "kinisi-robotics/kinisi_ros".into(),
+            head_owner: "blooop".into(),
+            branch: "ags/x".into(),
+        };
+        let argv: Vec<String> = c.to_args().iter().map(|a| a.to_string()).collect();
+        assert_eq!(Checkout::from_args(&argv), Some(c));
+        assert_eq!(Checkout::from_args(&argv[..2]), None);
+        let mut long = argv.clone();
+        long.push("extra".into());
+        assert_eq!(Checkout::from_args(&long), None);
     }
 
     #[test]

@@ -14,8 +14,8 @@ fn main() {
     // only the cache, so it is handled before stdin is read — there is none.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(pr::REFRESH_FLAG) {
-        if let [_, slug, head_owner, branch] = args.as_slice() {
-            pr::refresh(slug, head_owner, branch);
+        if let Some(checkout) = pr::Checkout::from_args(&args[1..]) {
+            pr::refresh(&checkout);
         }
         return;
     }
