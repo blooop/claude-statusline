@@ -154,6 +154,15 @@ fn gh_calls(root: &Path) -> String {
     fs::read_to_string(root.join("gh-args")).unwrap_or_default()
 }
 
+/// A payload that also carries Claude Code's own `pr`, with `url` verbatim.
+fn payload_with_pr(dir: &Path, url: &str) -> Vec<u8> {
+    format!(
+        r#"{{"model":{{"display_name":"Opus 5"}},"workspace":{{"current_dir":"{}"}},"pr":{{"number":11573,"url":"{url}","review_state":"approved"}}}}"#,
+        dir.display()
+    )
+    .into_bytes()
+}
+
 fn payload(dir: &Path) -> Vec<u8> {
     format!(
         r#"{{"model":{{"display_name":"Opus 5"}},"workspace":{{"current_dir":"{}"}}}}"#,
@@ -396,6 +405,50 @@ fn the_segment_can_be_switched_off_entirely() {
 }
 
 #[test]
+fn switching_the_segment_off_hides_claude_codes_pr_too() {
+    let scratch = Scratch::new("off-payload");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_NO_PR", "1"),
+    ];
+
+    let out = run_binary_env(&payload_with_pr(&work, PR_URL), &envs);
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(!line.contains("\u{1b}]8;;"), "no link: {line:?}");
+}
+
+#[test]
+fn an_unsafe_payload_url_is_dropped_and_the_lookup_answers_instead() {
+    let scratch = Scratch::new("payload-unsafe");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+    let input = payload_with_pr(&work, "javascript:x");
+
+    let first = String::from_utf8_lossy(&run_binary_env(&input, &envs).stdout).into_owned();
+    assert!(!visible(&first).contains("javascript:"), "{first:?}");
+    let line = render_until_pr(&input, &envs, Duration::from_secs(10));
+    assert!(!visible(&line).contains("javascript:"), "{line:?}");
+    assert!(visible(&line).contains(PR_URL), "the lookup's PR: {line:?}");
+}
+
+#[test]
 fn the_default_branch_asks_nothing_and_shows_nothing() {
     // `gh pr list --head main` matches every PR ever opened *from* a branch
     // called main — in kinisi_ros, a years-old PR that merged main into ci.
@@ -416,6 +469,10 @@ fn the_default_branch_asks_nothing_and_shows_nothing() {
     let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(2));
     assert!(!line.contains("\u{1b}]8;;"), "no link on main: {line:?}");
     assert_eq!(gh_calls(scratch.path()), "", "and gh never asked");
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
 }
 
 #[test]
@@ -439,6 +496,84 @@ fn a_default_branch_that_origin_head_names_is_skipped_too() {
     let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(2));
     assert!(!line.contains("\u{1b}]8;;"), "no link on develop: {line:?}");
     assert_eq!(gh_calls(scratch.path()), "");
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
+}
+
+#[test]
+fn a_default_branch_that_upstream_head_names_is_skipped_too() {
+    let scratch = Scratch::new("upstream-head");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "develop",
+        "[remote \"origin\"]\n\turl = git@github.com:blooop/kinisi_ros.git\n\
+         [remote \"upstream\"]\n\turl = https://github.com/kinisi-robotics/kinisi_ros.git\n",
+    );
+    let refs = work.join(".git/refs/remotes/upstream");
+    fs::create_dir_all(&refs).expect("refs");
+    fs::write(refs.join("HEAD"), "ref: refs/remotes/upstream/develop\n").expect("upstream/HEAD");
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(2));
+    assert!(!line.contains("\u{1b}]8;;"), "no link on develop: {line:?}");
+    assert_eq!(gh_calls(scratch.path()), "");
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
+}
+
+#[test]
+fn a_worktree_reads_its_default_branch_from_the_common_git_dir() {
+    // A `git worktree` checkout: `.git` is a file, HEAD is in the worktree's
+    // own git dir, and config and `origin/HEAD` are only in the common one.
+    // The feature worktree beside it shows the common config was really read,
+    // so the develop one's silence is the default-branch skip and not a miss.
+    let scratch = Scratch::new("worktree");
+    let common = scratch.path().join("main/.git");
+    fs::create_dir_all(&common).expect("common git dir");
+    fs::write(
+        common.join("config"),
+        "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n",
+    )
+    .expect("config");
+    let refs = common.join("refs/remotes/origin");
+    fs::create_dir_all(&refs).expect("refs");
+    fs::write(refs.join("HEAD"), "ref: refs/remotes/origin/develop\n").expect("origin/HEAD");
+    let worktree = |name: &str, branch: &str| {
+        let wt_git = common.join("worktrees").join(name);
+        fs::create_dir_all(&wt_git).expect("worktree git dir");
+        fs::write(wt_git.join("HEAD"), format!("ref: refs/heads/{branch}\n")).expect("HEAD");
+        fs::write(wt_git.join("commondir"), "../..\n").expect("commondir");
+        let work = scratch.path().join(name);
+        fs::create_dir_all(&work).expect("work dir");
+        fs::write(work.join(".git"), format!("gitdir: {}\n", wt_git.display())).expect(".git file");
+        work
+    };
+    let develop = worktree("w", "develop");
+    let feature = worktree("w2", "feature");
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&develop), &envs, Duration::from_secs(2));
+    assert!(!line.contains("\u{1b}]8;;"), "no link on develop: {line:?}");
+    assert_eq!(gh_calls(scratch.path()), "");
+
+    let line = render_until_pr(&payload(&feature), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "the feature worktree's PR: {line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(calls.contains("--head feature "), "{calls:?}");
 }
 
 #[test]
@@ -622,6 +757,11 @@ fn the_pr_claude_code_sends_is_shown_without_asking_gh() {
         text.contains(&format!("○ {PR_URL}")),
         "a draft, linked: {text:?}"
     );
-    std::thread::sleep(Duration::from_millis(300));
+    // The refresh lock is taken before the child is spawned, so no cache
+    // directory means no refresh was ever started.
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
     assert_eq!(gh_calls(scratch.path()), "", "gh never asked");
 }
