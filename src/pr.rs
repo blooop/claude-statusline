@@ -332,24 +332,38 @@ fn is_safe_url(url: &str) -> bool {
 
 /// Read what `dir`'s PR is looked up by straight out of the git directory.
 ///
-/// The branch is the one `branch.<name>.merge` pushes to, on the remote
-/// `branch.<name>.remote` names (origin when unset). The PR is asked of
-/// `upstream` when there is one, because in a fork clone that is where it was
-/// opened. The default branch is nobody's head, so it yields `None`.
+/// The PR's head is wherever `git push` would send the branch. That is the
+/// local name, unless `push.default` is `upstream`, when it is the branch
+/// `branch.<name>.merge` tracks; under any other mode `merge` is only where the
+/// branch pulls from, which for a stacked branch is its base's PR. The remote
+/// is `branch.<name>.pushRemote`, else `remote.pushDefault`, else
+/// `branch.<name>.remote`, else origin. The PR is asked of `upstream` when
+/// there is one, because in a fork clone that is where it was opened. The
+/// default branch is nobody's head, so it yields `None`.
 pub fn checkout(dir: &Path) -> Option<Checkout> {
     let (git_dir, common_dir) = git_dirs(dir)?;
     let local = head_branch(&fs::read_to_string(git_dir.join("HEAD")).ok()?)?;
     let config = fs::read_to_string(common_dir.join("config")).ok()?;
-    let branch = config_value(&config, "branch", &local, "merge")
-        .and_then(|m| m.strip_prefix("refs/heads/").map(str::to_string))
-        .unwrap_or_else(|| local.clone());
+    let get =
+        |section: &str, sub: Option<&str>, key: &str| config_value(&config, section, sub, key);
+    // `tracking` is git's deprecated spelling of `upstream`.
+    let push_upstream =
+        get("push", None, "default").is_some_and(|mode| mode == "upstream" || mode == "tracking");
+    let branch = match push_upstream {
+        true => get("branch", Some(&local), "merge")
+            .and_then(|m| m.strip_prefix("refs/heads/").map(str::to_string))
+            .unwrap_or_else(|| local.clone()),
+        false => local.clone(),
+    };
     if is_default_branch(&common_dir, &local) || is_default_branch(&common_dir, &branch) {
         return None;
     }
-    let push_remote =
-        config_value(&config, "branch", &local, "remote").unwrap_or_else(|| "origin".into());
-    let head = slug_from_url(&config_value(&config, "remote", &push_remote, "url")?)?;
-    let base = match config_value(&config, "remote", "upstream", "url") {
+    let push_remote = get("branch", Some(&local), "pushRemote")
+        .or_else(|| get("remote", None, "pushDefault"))
+        .or_else(|| get("branch", Some(&local), "remote"))
+        .unwrap_or_else(|| "origin".into());
+    let head = slug_from_url(&get("remote", Some(&push_remote), "url")?)?;
+    let base = match get("remote", Some("upstream"), "url") {
         Some(url) => slug_from_url(&url)?,
         None => head.clone(),
     };
@@ -424,13 +438,19 @@ fn head_branch(head: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-/// `key` from the `[section "subsection"]` block of a git config.
+/// `key` from the `[section "subsection"]` block of a git config, or from the
+/// bare `[section]` block when `subsection` is `None`.
 ///
 /// Enough INI to read git's own writing: section headers, `key = value`, `#`
 /// and `;` comments. Not a general parser — it never has to be, because the
 /// file it reads is one git wrote.
-fn config_value(config: &str, section: &str, subsection: &str, key: &str) -> Option<String> {
-    let quoted = format!("\"{subsection}\"");
+fn config_value(
+    config: &str,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+) -> Option<String> {
+    let quoted = subsection.map(|sub| format!("\"{sub}\""));
     let mut in_block = false;
     for raw in config.lines() {
         let line = raw.trim();
@@ -441,9 +461,14 @@ fn config_value(config: &str, section: &str, subsection: &str, key: &str) -> Opt
             // `[remote "origin"]`, and the subsection name is case-sensitive
             // where the section name is not.
             let header = header.trim();
-            in_block = header
-                .split_once(char::is_whitespace)
-                .is_some_and(|(s, name)| s.eq_ignore_ascii_case(section) && name.trim() == quoted);
+            in_block = match &quoted {
+                Some(quoted) => header
+                    .split_once(char::is_whitespace)
+                    .is_some_and(|(s, name)| {
+                        s.eq_ignore_ascii_case(section) && name.trim() == quoted
+                    }),
+                None => header.eq_ignore_ascii_case(section),
+            };
             continue;
         }
         if !in_block {
@@ -572,16 +597,26 @@ mod tests {
             config_value(
                 "[branch \"ags/x\"]\n\tmerge = refs/heads/ags/y\n",
                 "branch",
-                "ags/x",
+                Some("ags/x"),
                 "merge"
             )
             .as_deref(),
             Some("refs/heads/ags/y")
         );
+        // a section with no subsection, which a subsection lookup never matches
+        let push = "[remote \"origin\"]\n\tpushDefault = no\n[remote]\n\tpushDefault = fork\n";
+        assert_eq!(
+            config_value(push, "remote", None, "pushDefault").as_deref(),
+            Some("fork")
+        );
+        assert_eq!(
+            config_value(push, "remote", Some("origin"), "pushDefault").as_deref(),
+            Some("no")
+        );
     }
 
     fn origin(config: &str) -> Option<String> {
-        config_value(config, "remote", "origin", "url")
+        config_value(config, "remote", Some("origin"), "url")
     }
 
     #[test]

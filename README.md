@@ -122,8 +122,12 @@ never on the render path:
 What the fallback asks about is the branch as GitHub sees it, not as the
 checkout names it:
 
-* **The pushed name.** `branch.<name>.merge`, when it is set, names the branch
-  on the remote; the local name is only the fallback.
+* **The pushed name.** The branch `git push` would update: the local name,
+  unless `push.default` is `upstream`, when it is the one `branch.<name>.merge`
+  tracks. Otherwise `merge` is only where the branch pulls from, and for a
+  branch cut from another that is the other branch's PR.
+* **The pushed-to remote.** `branch.<name>.pushRemote`, else
+  `remote.pushDefault`, else `branch.<name>.remote`, else `origin`.
 * **The base repo.** `upstream` when the checkout has one, because in a fork
   clone that is where the PR was opened; otherwise the remote the branch
   pushes to.

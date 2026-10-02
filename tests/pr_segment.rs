@@ -415,15 +415,17 @@ fn a_pr_from_someone_elses_branch_of_the_same_name_is_passed_over() {
 
 #[test]
 fn a_fork_asks_upstream_about_the_branch_it_pushed_to() {
-    // A fork clone: origin is the fork, the PR lives on upstream, and the
-    // local branch pushes to a remote branch with another name.
+    // A fork clone: origin is the fork, the PR lives on upstream, and with
+    // `push.default = upstream` the local branch pushes to the branch it
+    // merges from, which has another name.
     let scratch = Scratch::new("fork");
     let work = plant_checkout_with(
         scratch.path(),
         "local-name",
         "[remote \"origin\"]\n\turl = git@github.com:blooop/kinisi_ros.git\n\
          [remote \"upstream\"]\n\turl = https://github.com/kinisi-robotics/kinisi_ros.git\n\
-         [branch \"local-name\"]\n\tremote = origin\n\tmerge = refs/heads/pushed/name\n",
+         [branch \"local-name\"]\n\tremote = origin\n\tmerge = refs/heads/pushed/name\n\
+         [push]\n\tdefault = upstream\n",
     );
     let from_fork = r#"[{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"blooop"}}]"#;
     let bin = plant_gh(scratch.path(), from_fork, 0);
@@ -440,6 +442,104 @@ fn a_fork_asks_upstream_about_the_branch_it_pushed_to() {
         calls.contains("--repo kinisi-robotics/kinisi_ros --head pushed/name"),
         "asked upstream about the pushed branch: {calls:?}"
     );
+}
+
+#[test]
+fn a_stacked_branch_asks_about_itself_not_the_branch_it_was_cut_from() {
+    // `git checkout -b my-fix origin/base-feature` records base-feature as the
+    // upstream. That is where the branch pulls from; under the default
+    // `push.default` it still pushes to `my-fix`, and that is its PR's head.
+    let scratch = Scratch::new("stacked");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "my-fix",
+        "[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n\
+         [branch \"my-fix\"]\n\tremote = origin\n\tmerge = refs/heads/base-feature\n",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "{line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(calls.contains("--head my-fix "), "{calls:?}");
+    assert!(!calls.contains("base-feature"), "{calls:?}");
+}
+
+#[test]
+fn a_branch_cut_from_main_is_still_asked_about() {
+    // `git checkout -b feat origin/main` tracks main. The default branch is
+    // nobody's head, but `feat` is, and it pushes to `feat`.
+    let scratch = Scratch::new("from-main");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "feat",
+        "[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n\
+         [branch \"feat\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "{line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(calls.contains("--head feat "), "{calls:?}");
+}
+
+/// A checkout that fetches from origin but pushes to a `fork` remote.
+fn plant_push_remote_checkout(root: &Path) -> PathBuf {
+    plant_checkout_with(
+        root,
+        "fix-ci",
+        "[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n\
+         [remote \"fork\"]\n\turl = git@github.com:blooop/kinisi_ros.git\n\
+         [branch \"fix-ci\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/fix-ci\n",
+    )
+}
+
+#[test]
+fn a_push_remote_names_the_head_owner() {
+    // The triangular workflow: fetch from origin, push to a fork. The PR's head
+    // is on the fork, so its owner is the one that counts.
+    let scratch = Scratch::new("push-remote");
+    let work = plant_push_remote_checkout(scratch.path());
+    let from_fork = r#"[{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"blooop"}}]"#;
+    let bin = plant_gh(scratch.path(), from_fork, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "the fork's PR: {line:?}");
+}
+
+#[test]
+fn a_push_remote_passes_over_the_fetch_remotes_pr() {
+    let scratch = Scratch::new("push-remote-miss");
+    let work = plant_push_remote_checkout(scratch.path());
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(3));
+    assert!(
+        !line.contains("\u{1b}]8;;"),
+        "origin's head is not ours: {line:?}"
+    );
+    assert_eq!(fs::read_to_string(cache_entry(&cache)).unwrap(), "null");
 }
 
 #[test]
