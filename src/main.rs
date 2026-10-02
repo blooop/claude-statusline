@@ -14,8 +14,8 @@ fn main() {
     // only the cache, so it is handled before stdin is read — there is none.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) == Some(pr::REFRESH_FLAG) {
-        if let [_, slug, branch] = args.as_slice() {
-            pr::refresh(slug, branch);
+        if let [_, slug, head_owner, branch] = args.as_slice() {
+            pr::refresh(slug, head_owner, branch);
         }
         return;
     }
@@ -30,7 +30,7 @@ fn main() {
 
     // File reads only — never the network. A stale or missing answer spawns a
     // refresh for the next render and yields None for this one.
-    let found = pr::payload_dir(&input).and_then(|dir| pr::lookup(&dir));
+    let found = pr::find(&input);
 
     match render(&input, now_epoch(), found.as_ref()) {
         Render::Line(line) => {
