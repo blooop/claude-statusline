@@ -120,8 +120,10 @@ fn payload_pr(pr: &Value) -> Option<Pr> {
     if !is_safe_url(url) {
         return None;
     }
-    // review_state is approved / changes_requested / pending for an open PR;
-    // only the GitLab path ever reports merged or closed.
+    // Claude Code sends `draft` for a draft PR and approved / changes_requested
+    // / pending for any other open one; its GitLab path adds `merged`. `closed`
+    // is read in case a later build sends it. Anything unknown is shown as
+    // open on purpose: the payload only ever names a live PR.
     let state = match pr.get("review_state").and_then(Value::as_str) {
         Some("draft") => State::Draft,
         Some("merged") => State::Merged,
