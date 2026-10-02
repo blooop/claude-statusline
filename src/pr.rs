@@ -45,6 +45,9 @@ const LOCK_STALE: Duration = Duration::from_secs(60);
 /// The argv[1] that puts this binary in refresh mode. Not a documented
 /// interface: the only thing that passes it is [`spawn_refresh`] below.
 pub const REFRESH_FLAG: &str = "--refresh-pr";
+/// How many same-named heads one `gh pr list` asks for. A page this full with
+/// none of them ours may have cut ours off, so it is no answer at all.
+const PAGE: usize = 20;
 
 // ---------------------------------------------------------------------------
 // What we found
@@ -76,27 +79,90 @@ pub struct Pr {
     pub state: State,
 }
 
-/// Which repo, which branch — the pair a PR is looked up by.
+/// Which repo, whose branch, which branch — what a PR is looked up by.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Checkout {
-    /// `owner/repo`, as `gh --repo` wants it.
+    /// `owner/repo` the PR is opened against, as `gh --repo` wants it.
     pub slug: String,
+    /// Owner of the repo the branch is pushed to. `gh --head` matches the
+    /// branch name alone, so this is what tells our `fix-ci` from a fork's.
+    pub head_owner: String,
+    /// The branch's name on the remote it pushes to.
     pub branch: String,
+}
+
+impl Checkout {
+    /// The refresh child's argv after [`REFRESH_FLAG`]. [`Checkout::from_args`]
+    /// reads it back, and the order lives only in these two functions.
+    pub fn to_args(&self) -> [&str; 3] {
+        [&self.slug, &self.head_owner, &self.branch]
+    }
+
+    /// The inverse of [`Checkout::to_args`]; any other arity is not ours.
+    pub fn from_args(args: &[String]) -> Option<Checkout> {
+        match args {
+            [slug, head_owner, branch] => Some(Checkout {
+                slug: slug.clone(),
+                head_owner: head_owner.clone(),
+                branch: branch.clone(),
+            }),
+            _ => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // The hot path
 // ---------------------------------------------------------------------------
 
-/// The PR for whatever branch `dir` is on, if a previous run has found one.
+/// The PR for the session's branch: Claude Code's, else the cached lookup's.
 ///
-/// Never blocks on the network, and never fails loudly: every step that could
-/// go wrong (no repo, detached HEAD, no origin, no cache, unreadable cache)
-/// yields `None`, which renders as no segment at all.
-pub fn lookup(dir: &Path) -> Option<Pr> {
+/// Claude Code sends its own answer as `pr` in the payload, already resolved
+/// against the fork parent and the head owner, so that one wins and costs no
+/// refresh. It only ever reports an *open* PR, though, so when it is absent
+/// the lookup below still runs and can find a merged or closed one.
+pub fn find(input: &[u8]) -> Option<Pr> {
     if std::env::var_os("CLAUDE_STATUSLINE_NO_PR").is_some() {
         return None;
     }
+    let v: Value = serde_json::from_slice(input).ok()?;
+    if let Some(pr) = v.get("pr").and_then(payload_pr) {
+        return Some(pr);
+    }
+    let dir = v.get("workspace")?.get("current_dir")?.as_str()?;
+    (!dir.is_empty()).then(|| lookup(Path::new(OsStr::new(dir))))?
+}
+
+/// The payload's `pr` object, if it names a number and a safe URL.
+fn payload_pr(pr: &Value) -> Option<Pr> {
+    let number = pr.get("number")?.as_u64()?;
+    let url = pr.get("url")?.as_str()?;
+    if !is_safe_url(url) {
+        return None;
+    }
+    // Claude Code sends `draft` for a draft PR and approved / changes_requested
+    // / pending for any other open one; its GitLab path adds `merged`. `closed`
+    // is read in case a later build sends it. Anything unknown is shown as
+    // open on purpose: the payload only ever names a live PR.
+    let state = match pr.get("review_state").and_then(Value::as_str) {
+        Some("draft") => State::Draft,
+        Some("merged") => State::Merged,
+        Some("closed") => State::Closed,
+        _ => State::Open,
+    };
+    Some(Pr {
+        number,
+        url: url.to_string(),
+        state,
+    })
+}
+
+/// The PR for whatever branch `dir` is on, if a previous run has found one.
+///
+/// Never blocks on the network, and never fails loudly: every step that could
+/// go wrong (no repo, detached HEAD, default branch, no remote, no cache,
+/// unreadable cache) yields `None`, which renders as no segment at all.
+pub fn lookup(dir: &Path) -> Option<Pr> {
     let checkout = checkout(dir)?;
     let path = cache_path(&checkout)?;
 
@@ -170,8 +236,7 @@ fn spawn_refresh(checkout: &Checkout, cache: &Path) {
     // the prompt the status line is drawn in.
     let spawned = Command::new(exe)
         .arg(REFRESH_FLAG)
-        .arg(&checkout.slug)
-        .arg(&checkout.branch)
+        .args(checkout.to_args())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -186,16 +251,18 @@ fn spawn_refresh(checkout: &Checkout, cache: &Path) {
 // ---------------------------------------------------------------------------
 
 /// Ask GitHub, write the answer, drop the lock. Runs in the spawned child.
-pub fn refresh(slug: &str, branch: &str) {
-    let checkout = Checkout {
-        slug: slug.to_string(),
-        branch: branch.to_string(),
-    };
-    let Some(path) = cache_path(&checkout) else {
+pub fn refresh(checkout: &Checkout) {
+    let Checkout {
+        slug,
+        head_owner,
+        branch,
+    } = checkout;
+    let Some(path) = cache_path(checkout) else {
         return;
     };
     // `--state all`, because a merged PR is still the answer to "what is this
-    // branch": the branch outlives the merge and the link stays useful.
+    // branch": the branch outlives the merge and the link stays useful. More
+    // than one, because forks' same-named branches share the list with ours.
     let out = Command::new("gh")
         .args([
             "pr",
@@ -207,9 +274,9 @@ pub fn refresh(slug: &str, branch: &str) {
             "--state",
             "all",
             "--limit",
-            "1",
+            &PAGE.to_string(),
             "--json",
-            "number,url,state,isDraft",
+            "number,url,state,isDraft,headRepositoryOwner",
         ])
         .stdin(Stdio::null())
         .stderr(Stdio::null())
@@ -220,28 +287,36 @@ pub fn refresh(slug: &str, branch: &str) {
     // retries. Only a successful call is allowed to erase a known PR.
     if let Ok(out) = out {
         if out.status.success() {
-            if let Some(parent) = path.parent() {
-                let _ = fs::create_dir_all(parent);
+            if let Some(json) = first_pr_json(&out.stdout, head_owner) {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&path, json);
             }
-            let _ = fs::write(&path, first_pr_json(&out.stdout));
         }
     }
     let _ = fs::remove_file(path.with_extension("lock"));
 }
 
-/// The first element of `gh`'s array, or `null` for an empty one.
+/// The first PR in `gh`'s array whose head is `head_owner`'s, else `null` —
+/// or `None` when a full [`PAGE`] held none of ours, and so settles nothing.
 ///
 /// Stored as `gh` shaped it rather than re-encoded, so the cache file is
-/// readable and the parse below has one shape to handle.
-fn first_pr_json(stdout: &[u8]) -> Vec<u8> {
+/// readable and the parse below has one shape to handle. GitHub logins are
+/// case-insensitive, and a remote URL need not spell one as GitHub does.
+fn first_pr_json(stdout: &[u8], head_owner: &str) -> Option<Vec<u8>> {
     let parsed: Option<Value> = serde_json::from_slice(stdout).ok();
-    match parsed
-        .as_ref()
-        .and_then(|v| v.as_array())
-        .and_then(|a| a.first())
-    {
-        Some(pr) => serde_json::to_vec(pr).unwrap_or_else(|_| b"null".to_vec()),
-        None => b"null".to_vec(),
+    let ours = |pr: &&Value| {
+        pr.get("headRepositoryOwner")
+            .and_then(|o| o.get("login"))
+            .and_then(Value::as_str)
+            .is_some_and(|login| login.eq_ignore_ascii_case(head_owner))
+    };
+    let rows = parsed.as_ref().and_then(|v| v.as_array());
+    match rows.and_then(|a| a.iter().find(ours)) {
+        Some(pr) => Some(serde_json::to_vec(pr).unwrap_or_else(|_| b"null".to_vec())),
+        None if rows.is_some_and(|a| a.len() >= PAGE) => None,
+        None => Some(b"null".to_vec()),
     }
 }
 
@@ -279,14 +354,68 @@ fn is_safe_url(url: &str) -> bool {
 // Where the session is
 // ---------------------------------------------------------------------------
 
-/// Read `dir`'s repo slug and branch straight out of the git directory.
+/// Read what `dir`'s PR is looked up by straight out of the git directory.
+///
+/// The PR's head is wherever `git push` would send the branch. That is the
+/// local name, unless `push.default` is `upstream`, when it is the branch
+/// `branch.<name>.merge` tracks; under any other mode `merge` is only where the
+/// branch pulls from, which for a stacked branch is its base's PR. The remote
+/// is `branch.<name>.pushRemote`, else `remote.pushDefault`, else
+/// `branch.<name>.remote`, else origin. The PR is asked of `upstream` when
+/// there is one, because in a fork clone that is where it was opened. The
+/// default branch is nobody's head, so it yields `None`.
 pub fn checkout(dir: &Path) -> Option<Checkout> {
     let (git_dir, common_dir) = git_dirs(dir)?;
-    let branch = head_branch(&fs::read_to_string(git_dir.join("HEAD")).ok()?)?;
-    let url = origin_url(&fs::read_to_string(common_dir.join("config")).ok()?)?;
+    let local = head_branch(&fs::read_to_string(git_dir.join("HEAD")).ok()?)?;
+    let config = fs::read_to_string(common_dir.join("config")).ok()?;
+    let get =
+        |section: &str, sub: Option<&str>, key: &str| config_value(&config, section, sub, key);
+    // `tracking` is git's deprecated spelling of `upstream`.
+    let push_upstream =
+        get("push", None, "default").is_some_and(|mode| mode == "upstream" || mode == "tracking");
+    let branch = match push_upstream {
+        true => get("branch", Some(&local), "merge")
+            .and_then(|m| m.strip_prefix("refs/heads/").map(str::to_string))
+            .unwrap_or_else(|| local.clone()),
+        false => local.clone(),
+    };
+    if is_default_branch(&common_dir, &local) || is_default_branch(&common_dir, &branch) {
+        return None;
+    }
+    let push_remote = get("branch", Some(&local), "pushRemote")
+        .or_else(|| get("remote", None, "pushDefault"))
+        .or_else(|| get("branch", Some(&local), "remote"))
+        .unwrap_or_else(|| "origin".into());
+    let head = slug_from_url(&get("remote", Some(&push_remote), "url")?)?;
+    let base = match get("remote", Some("upstream"), "url") {
+        Some(url) => slug_from_url(&url)?,
+        None => head.clone(),
+    };
     Some(Checkout {
-        slug: slug_from_url(&url)?,
+        slug: base,
+        head_owner: head.split_once('/')?.0.to_string(),
         branch,
+    })
+}
+
+/// Whether `branch` is a default branch: `main`, `master`, or whatever
+/// `origin/HEAD` or `upstream/HEAD` points at. Those symbolic refs are never
+/// packed, so a file read is the whole answer.
+fn is_default_branch(common_dir: &Path, branch: &str) -> bool {
+    if branch == "main" || branch == "master" {
+        return true;
+    }
+    ["origin", "upstream"].iter().any(|remote| {
+        let head = common_dir.join("refs/remotes").join(remote).join("HEAD");
+        fs::read_to_string(head).ok().is_some_and(|text| {
+            text.trim()
+                .strip_prefix("ref:")
+                .map(str::trim)
+                .and_then(|r| r.strip_prefix("refs/remotes/"))
+                .and_then(|r| r.strip_prefix(*remote))
+                .and_then(|r| r.strip_prefix('/'))
+                == Some(branch)
+        })
     })
 }
 
@@ -333,13 +462,20 @@ fn head_branch(head: &str) -> Option<String> {
     (!branch.is_empty()).then(|| branch.to_string())
 }
 
-/// `url` from the `[remote "origin"]` section of a git config.
+/// `key` from the `[section "subsection"]` block of a git config, or from the
+/// bare `[section]` block when `subsection` is `None`.
 ///
 /// Enough INI to read git's own writing: section headers, `key = value`, `#`
 /// and `;` comments. Not a general parser — it never has to be, because the
 /// file it reads is one git wrote.
-fn origin_url(config: &str) -> Option<String> {
-    let mut in_origin = false;
+fn config_value(
+    config: &str,
+    section: &str,
+    subsection: Option<&str>,
+    key: &str,
+) -> Option<String> {
+    let quoted = subsection.map(|sub| format!("\"{sub}\""));
+    let mut in_block = false;
     for raw in config.lines() {
         let line = raw.trim();
         if line.starts_with('#') || line.starts_with(';') {
@@ -349,18 +485,21 @@ fn origin_url(config: &str) -> Option<String> {
             // `[remote "origin"]`, and the subsection name is case-sensitive
             // where the section name is not.
             let header = header.trim();
-            in_origin = header
-                .split_once(char::is_whitespace)
-                .is_some_and(|(section, name)| {
-                    section.eq_ignore_ascii_case("remote") && name.trim() == "\"origin\""
-                });
+            in_block = match &quoted {
+                Some(quoted) => header
+                    .split_once(char::is_whitespace)
+                    .is_some_and(|(s, name)| {
+                        s.eq_ignore_ascii_case(section) && name.trim() == quoted
+                    }),
+                None => header.eq_ignore_ascii_case(section),
+            };
             continue;
         }
-        if !in_origin {
+        if !in_block {
             continue;
         }
-        if let Some((key, value)) = line.split_once('=') {
-            if key.trim().eq_ignore_ascii_case("url") {
+        if let Some((k, value)) = line.split_once('=') {
+            if k.trim().eq_ignore_ascii_case(key) {
                 let value = value.trim();
                 if !value.is_empty() {
                     return Some(value.to_string());
@@ -406,7 +545,10 @@ fn cache_path(checkout: &Checkout) -> Option<PathBuf> {
     // Readable stem plus a hash of the exact pair: the stem is for whoever
     // opens the cache directory wondering what is in it, and the hash is what
     // actually keeps `feat/a` and `feat-a` apart once slashes are flattened.
-    let key = format!("{}\n{}", checkout.slug, checkout.branch);
+    let key = format!(
+        "{}\n{}\n{}",
+        checkout.slug, checkout.head_owner, checkout.branch
+    );
     let stem: String = key
         .chars()
         .map(|c| match c {
@@ -430,13 +572,6 @@ fn fnv1a(bytes: &[u8]) -> u64 {
         h = h.wrapping_mul(0x1000_0000_01b3);
     }
     h
-}
-
-/// The `workspace.current_dir` a payload names, if it names one.
-pub fn payload_dir(input: &[u8]) -> Option<PathBuf> {
-    let v: Value = serde_json::from_slice(input).ok()?;
-    let dir = v.get("workspace")?.get("current_dir")?.as_str()?;
-    (!dir.is_empty()).then(|| PathBuf::from(OsStr::new(dir)))
 }
 
 #[cfg(test)]
@@ -473,14 +608,39 @@ mod tests {
 \tremote = origin
 ";
         assert_eq!(
-            origin_url(config).as_deref(),
+            origin(config).as_deref(),
             Some("git@github.com:kinisi-robotics/kinisi_ros.git")
         );
         // upstream-only: not origin, so nothing
-        assert_eq!(origin_url("[remote \"upstream\"]\n\turl = x\n"), None);
-        assert_eq!(origin_url("[core]\n\turl = not-a-remote\n"), None);
+        assert_eq!(origin("[remote \"upstream\"]\n\turl = x\n"), None);
+        assert_eq!(origin("[core]\n\turl = not-a-remote\n"), None);
         // a commented-out origin is not an origin
-        assert_eq!(origin_url("# [remote \"origin\"]\n#\turl = x\n"), None);
+        assert_eq!(origin("# [remote \"origin\"]\n#\turl = x\n"), None);
+        // a branch name with a slash is one subsection, quoted whole
+        assert_eq!(
+            config_value(
+                "[branch \"ags/x\"]\n\tmerge = refs/heads/ags/y\n",
+                "branch",
+                Some("ags/x"),
+                "merge"
+            )
+            .as_deref(),
+            Some("refs/heads/ags/y")
+        );
+        // a section with no subsection, which a subsection lookup never matches
+        let push = "[remote \"origin\"]\n\tpushDefault = no\n[remote]\n\tpushDefault = fork\n";
+        assert_eq!(
+            config_value(push, "remote", None, "pushDefault").as_deref(),
+            Some("fork")
+        );
+        assert_eq!(
+            config_value(push, "remote", Some("origin"), "pushDefault").as_deref(),
+            Some("no")
+        );
+    }
+
+    fn origin(config: &str) -> Option<String> {
+        config_value(config, "remote", Some("origin"), "url")
     }
 
     #[test]
@@ -528,18 +688,35 @@ mod tests {
 
     #[test]
     fn gh_output_reduces_to_the_first_pr_or_null() {
-        let one = br#"[{"isDraft":false,"number":11573,"state":"OPEN","url":"https://github.com/o/r/pull/11573"}]"#;
-        let pr = parse_cache(&first_pr_json(one)).expect("a pr");
+        let one = br#"[{"isDraft":false,"number":11573,"state":"OPEN","url":"https://github.com/o/r/pull/11573","headRepositoryOwner":{"login":"o"}}]"#;
+        let pr = parse_cache(&first_pr_json(one, "o").expect("an answer")).expect("a pr");
         assert_eq!(pr.number, 11573);
         assert_eq!(pr.state, State::Open);
         assert_eq!(pr.url, "https://github.com/o/r/pull/11573");
 
-        assert_eq!(first_pr_json(b"[]"), b"null");
+        assert_eq!(first_pr_json(b"[]", "o").as_deref(), Some(&b"null"[..]));
+        // someone else's head is not ours, and neither is a head with no owner
+        assert_eq!(first_pr_json(one, "fork").as_deref(), Some(&b"null"[..]));
+        assert_eq!(
+            first_pr_json(br#"[{"number":1,"url":"https://x/1"}]"#, "o").as_deref(),
+            Some(&b"null"[..])
+        );
+        // a full page of other owners' heads may have cut ours off
+        let full = format!("[{}]", vec![r#"{"number":1}"#; PAGE].join(","));
+        assert_eq!(first_pr_json(full.as_bytes(), "o"), None);
+        let short = format!("[{}]", vec![r#"{"number":1}"#; PAGE - 1].join(","));
+        assert_eq!(
+            first_pr_json(short.as_bytes(), "o").as_deref(),
+            Some(&b"null"[..])
+        );
         assert_eq!(parse_cache(b"null"), None);
         // a half-written or truncated cache is nothing, never a panic
         assert_eq!(parse_cache(b""), None);
         assert_eq!(parse_cache(br#"{"number":1}"#), None);
-        assert_eq!(first_pr_json(b"not json"), b"null");
+        assert_eq!(
+            first_pr_json(b"not json", "o").as_deref(),
+            Some(&b"null"[..])
+        );
     }
 
     #[test]
@@ -553,11 +730,27 @@ mod tests {
     }
 
     #[test]
+    fn a_checkout_survives_the_trip_through_the_refresh_argv() {
+        let c = Checkout {
+            slug: "kinisi-robotics/kinisi_ros".into(),
+            head_owner: "blooop".into(),
+            branch: "ags/x".into(),
+        };
+        let argv: Vec<String> = c.to_args().iter().map(|a| a.to_string()).collect();
+        assert_eq!(Checkout::from_args(&argv), Some(c));
+        assert_eq!(Checkout::from_args(&argv[..2]), None);
+        let mut long = argv.clone();
+        long.push("extra".into());
+        assert_eq!(Checkout::from_args(&long), None);
+    }
+
+    #[test]
     fn the_cache_key_separates_branches_that_flatten_alike() {
         let p = |branch: &str| {
             std::env::set_var("CLAUDE_STATUSLINE_CACHE", "/tmp/cs-test");
             cache_path(&Checkout {
                 slug: "o/r".into(),
+                head_owner: "o".into(),
                 branch: branch.into(),
             })
             .unwrap()
@@ -567,14 +760,26 @@ mod tests {
     }
 
     #[test]
-    fn a_payload_without_a_workspace_names_no_directory() {
+    fn a_payload_pr_needs_a_number_and_a_safe_url() {
+        let pr = |json: &str| payload_pr(&serde_json::from_str(json).unwrap());
+        let open =
+            pr(r#"{"number":7,"url":"https://github.com/o/r/pull/7","review_state":"approved"}"#)
+                .expect("a pr");
+        assert_eq!((open.number, open.state), (7, State::Open));
         assert_eq!(
-            payload_dir(br#"{"workspace":{"current_dir":"/home/x"}}"#),
-            Some(PathBuf::from("/home/x"))
+            pr(r#"{"number":7,"url":"https://x/7","review_state":"draft"}"#).map(|p| p.state),
+            Some(State::Draft)
         );
-        assert_eq!(payload_dir(br#"{"workspace":{"current_dir":""}}"#), None);
-        assert_eq!(payload_dir(br#"{"model":{"display_name":"Opus 5"}}"#), None);
-        assert_eq!(payload_dir(b"[]"), None);
-        assert_eq!(payload_dir(b""), None);
+        assert_eq!(pr(r#"{"url":"https://x/7"}"#), None);
+        assert_eq!(pr(r#"{"number":7}"#), None);
+        assert_eq!(pr(r#"{"number":7,"url":"javascript:alert(1)"}"#), None);
+    }
+
+    #[test]
+    fn a_payload_without_a_pr_or_a_workspace_finds_nothing() {
+        assert_eq!(find(br#"{"workspace":{"current_dir":""}}"#), None);
+        assert_eq!(find(br#"{"model":{"display_name":"Opus 5"}}"#), None);
+        assert_eq!(find(b"[]"), None);
+        assert_eq!(find(b""), None);
     }
 }

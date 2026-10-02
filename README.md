@@ -94,9 +94,12 @@ JSON, prints a bare `⏳`.
 
 ## Where the PR number comes from
 
-Everything else on the line is in the payload on stdin. A PR number is not, and
-`gh pr list` is ~450ms against a warm cache — per render, on every message. So
-the lookup is never on the render path:
+Recent Claude Code builds put their own answer in the payload as `pr`, already
+resolved against the fork parent and the head owner. When it is there it wins,
+and nothing is looked up. It only ever names an *open* PR, though, so when it is
+absent the line falls back to a lookup of its own. That one is ~450ms of
+`gh pr list` against a warm cache — per render, on every message — so it is
+never on the render path:
 
 * **`.git/HEAD` and `.git/config` are read directly**, not via `git rev-parse`.
   Two file reads instead of two fork+execs, and it makes the cache key
@@ -116,9 +119,33 @@ the lookup is never on the render path:
   asked yet" resolves itself within a second, and until it does it should look
   like what it will probably turn out to be: a branch with no PR.
 
+What the fallback asks about is the branch as GitHub sees it, not as the
+checkout names it:
+
+* **The pushed name.** The branch `git push` would update: the local name,
+  unless `push.default` is `upstream`, when it is the one `branch.<name>.merge`
+  tracks. Otherwise `merge` is only where the branch pulls from, and for a
+  branch cut from another that is the other branch's PR.
+* **The pushed-to remote.** `branch.<name>.pushRemote`, else
+  `remote.pushDefault`, else `branch.<name>.remote`, else `origin`.
+* **The base repo.** `upstream` when the checkout has one, because in a fork
+  clone that is where the PR was opened; otherwise the remote the branch
+  pushes to.
+* **The head owner.** `gh pr list --head` matches the branch name alone, so a
+  fork's `fix-ci` comes back beside ours. Only a PR whose head lives on our
+  remote's owner counts.
+* **Never the default branch.** `main`, `master`, or whatever `origin/HEAD` or
+  `upstream/HEAD` points at is nobody's head. Asking about it finds any old PR
+  that once merged the default branch into something else, so it shows nothing
+  and asks nothing.
+
 A merged PR still shows, because the branch outlives the merge and the link
 stays worth having. A detached HEAD shows nothing: no branch, no PR, and a raw
 sha in the line is only noise.
+
+The checkout is the session's `workspace.current_dir` — where Claude Code was
+started, not wherever a shell later `cd`'d to. Start it inside the checkout
+whose PR you want on the line.
 
 ## Fidelity
 

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use support::run_binary_env;
 
 const PR_URL: &str = "https://github.com/kinisi-robotics/kinisi_ros/pull/11573";
-const GH_ONE_OPEN_PR: &str = r#"[{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false}]"#;
+const GH_ONE_OPEN_PR: &str = r#"[{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"kinisi-robotics"}}]"#;
 
 /// What a terminal actually shows: the line with its escape sequences removed.
 ///
@@ -91,26 +91,42 @@ impl Drop for Scratch {
 
 /// A directory that looks enough like a checkout to be read as one.
 fn plant_checkout(root: &Path, branch: &str, origin: &str) -> PathBuf {
+    plant_checkout_with(
+        root,
+        branch,
+        &format!("[remote \"origin\"]\n\turl = {origin}\n"),
+    )
+}
+
+/// A checkout whose config, past `[core]`, is `extra` verbatim.
+fn plant_checkout_with(root: &Path, branch: &str, extra: &str) -> PathBuf {
     let work = root.join("work");
     let git = work.join(".git");
     fs::create_dir_all(&git).expect("git dir");
     fs::write(git.join("HEAD"), format!("ref: refs/heads/{branch}\n")).expect("HEAD");
     fs::write(
         git.join("config"),
-        format!("[core]\n\tbare = false\n[remote \"origin\"]\n\turl = {origin}\n"),
+        format!("[core]\n\tbare = false\n{extra}"),
     )
     .expect("config");
     work
 }
 
 /// A `gh` on PATH that prints `stdout` and exits 0, or exits `code` if given.
+///
+/// Every call appends its argv to `<root>/gh-args`, one call per line, so a
+/// test can see which repo and branch were asked about.
 fn plant_gh(root: &Path, stdout: &str, code: i32) -> PathBuf {
     let bin = root.join("bin");
     fs::create_dir_all(&bin).expect("bin dir");
     let gh = bin.join("gh");
+    let log = root.join("gh-args");
     fs::write(
         &gh,
-        format!("#!/bin/sh\nprintf '%s' '{stdout}'\nexit {code}\n"),
+        format!(
+            "#!/bin/sh\necho \"$*\" >> '{}'\nprintf '%s' '{stdout}'\nexit {code}\n",
+            log.display()
+        ),
     )
     .expect("gh");
     #[cfg(unix)]
@@ -131,6 +147,20 @@ fn cache_entry(cache: &Path) -> PathBuf {
         .collect();
     assert_eq!(found.len(), 1, "expected one cache entry: {found:?}");
     found.remove(0)
+}
+
+/// Every `gh` call the stub has seen, one argv per line.
+fn gh_calls(root: &Path) -> String {
+    fs::read_to_string(root.join("gh-args")).unwrap_or_default()
+}
+
+/// A payload that also carries Claude Code's own `pr`, with `url` verbatim.
+fn payload_with_pr(dir: &Path, url: &str) -> Vec<u8> {
+    format!(
+        r#"{{"model":{{"display_name":"Opus 5"}},"workspace":{{"current_dir":"{}"}},"pr":{{"number":11573,"url":"{url}","review_state":"approved"}}}}"#,
+        dir.display()
+    )
+    .into_bytes()
 }
 
 fn payload(dir: &Path) -> Vec<u8> {
@@ -278,6 +308,58 @@ fn a_gh_that_fails_leaves_the_last_good_answer_standing() {
 }
 
 #[test]
+fn a_full_page_of_other_owners_prs_leaves_the_last_good_answer_standing() {
+    // `--head` matches by name alone, so a popular branch name can fill the
+    // whole `--limit` with forks' PRs and push ours off the page. That page
+    // says nothing about our PR, so it must not erase the one we know.
+    let scratch = Scratch::new("full-page");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let cache = scratch.path().join("cache");
+    let cache_s = cache.to_str().unwrap().to_string();
+    let good = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let input = payload(&work);
+    let primed = render_until_pr(
+        &input,
+        &[
+            ("PATH", good.to_str().unwrap()),
+            ("CLAUDE_STATUSLINE_CACHE", &cache_s),
+        ],
+        Duration::from_secs(10),
+    );
+    assert!(primed.contains(PR_URL), "primed: {primed:?}");
+
+    let rows: Vec<String> = (1..=20)
+        .map(|n| {
+            format!(
+                r#"{{"number":{n},"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/{n}","state":"OPEN","isDraft":false,"headRepositoryOwner":{{"login":"fork{n}"}}}}"#
+            )
+        })
+        .collect();
+    let crowded = plant_gh(scratch.path(), &format!("[{}]", rows.join(",")), 0);
+    let envs = [
+        ("PATH", crowded.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", &cache_s[..]),
+        ("CLAUDE_STATUSLINE_PR_TTL", "0"),
+    ];
+    let line = String::from_utf8_lossy(&run_binary_env(&input, &envs).stdout).into_owned();
+    assert!(line.contains(PR_URL), "stale but still linked: {line:?}");
+
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        fs::read_to_string(cache_entry(&cache))
+            .unwrap()
+            .contains("11573"),
+        "a page with no room for our PR must not overwrite it"
+    );
+    let again = String::from_utf8_lossy(&run_binary_env(&input, &envs).stdout).into_owned();
+    assert!(again.contains(PR_URL), "still linked: {again:?}");
+}
+
+#[test]
 fn a_directory_that_is_not_a_checkout_asks_nothing_and_shows_nothing() {
     let scratch = Scratch::new("norepo");
     let plain = scratch.path().join("plain");
@@ -320,4 +402,366 @@ fn the_segment_can_be_switched_off_entirely() {
         !cache.join("claude-statusline").exists(),
         "and no background work either"
     );
+}
+
+#[test]
+fn switching_the_segment_off_hides_claude_codes_pr_too() {
+    let scratch = Scratch::new("off-payload");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_NO_PR", "1"),
+    ];
+
+    let out = run_binary_env(&payload_with_pr(&work, PR_URL), &envs);
+    let line = String::from_utf8_lossy(&out.stdout);
+    assert!(!line.contains("\u{1b}]8;;"), "no link: {line:?}");
+}
+
+#[test]
+fn an_unsafe_payload_url_is_dropped_and_the_lookup_answers_instead() {
+    let scratch = Scratch::new("payload-unsafe");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+    let input = payload_with_pr(&work, "javascript:x");
+
+    let first = String::from_utf8_lossy(&run_binary_env(&input, &envs).stdout).into_owned();
+    assert!(!visible(&first).contains("javascript:"), "{first:?}");
+    let line = render_until_pr(&input, &envs, Duration::from_secs(10));
+    assert!(!visible(&line).contains("javascript:"), "{line:?}");
+    assert!(visible(&line).contains(PR_URL), "the lookup's PR: {line:?}");
+}
+
+#[test]
+fn the_default_branch_asks_nothing_and_shows_nothing() {
+    // `gh pr list --head main` matches every PR ever opened *from* a branch
+    // called main — in kinisi_ros, a years-old PR that merged main into ci.
+    // The default branch is not a PR's head, so it gets no segment at all.
+    let scratch = Scratch::new("default");
+    let work = plant_checkout(
+        scratch.path(),
+        "main",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(2));
+    assert!(!line.contains("\u{1b}]8;;"), "no link on main: {line:?}");
+    assert_eq!(gh_calls(scratch.path()), "", "and gh never asked");
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
+}
+
+#[test]
+fn a_default_branch_that_origin_head_names_is_skipped_too() {
+    let scratch = Scratch::new("origin-head");
+    let work = plant_checkout(
+        scratch.path(),
+        "develop",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let refs = work.join(".git/refs/remotes/origin");
+    fs::create_dir_all(&refs).expect("refs");
+    fs::write(refs.join("HEAD"), "ref: refs/remotes/origin/develop\n").expect("origin/HEAD");
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(2));
+    assert!(!line.contains("\u{1b}]8;;"), "no link on develop: {line:?}");
+    assert_eq!(gh_calls(scratch.path()), "");
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
+}
+
+#[test]
+fn a_default_branch_that_upstream_head_names_is_skipped_too() {
+    let scratch = Scratch::new("upstream-head");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "develop",
+        "[remote \"origin\"]\n\turl = git@github.com:blooop/kinisi_ros.git\n\
+         [remote \"upstream\"]\n\turl = https://github.com/kinisi-robotics/kinisi_ros.git\n",
+    );
+    let refs = work.join(".git/refs/remotes/upstream");
+    fs::create_dir_all(&refs).expect("refs");
+    fs::write(refs.join("HEAD"), "ref: refs/remotes/upstream/develop\n").expect("upstream/HEAD");
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(2));
+    assert!(!line.contains("\u{1b}]8;;"), "no link on develop: {line:?}");
+    assert_eq!(gh_calls(scratch.path()), "");
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
+}
+
+#[test]
+fn a_worktree_reads_its_default_branch_from_the_common_git_dir() {
+    // A `git worktree` checkout: `.git` is a file, HEAD is in the worktree's
+    // own git dir, and config and `origin/HEAD` are only in the common one.
+    // The feature worktree beside it shows the common config was really read,
+    // so the develop one's silence is the default-branch skip and not a miss.
+    let scratch = Scratch::new("worktree");
+    let common = scratch.path().join("main/.git");
+    fs::create_dir_all(&common).expect("common git dir");
+    fs::write(
+        common.join("config"),
+        "[core]\n\tbare = false\n[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n",
+    )
+    .expect("config");
+    let refs = common.join("refs/remotes/origin");
+    fs::create_dir_all(&refs).expect("refs");
+    fs::write(refs.join("HEAD"), "ref: refs/remotes/origin/develop\n").expect("origin/HEAD");
+    let worktree = |name: &str, branch: &str| {
+        let wt_git = common.join("worktrees").join(name);
+        fs::create_dir_all(&wt_git).expect("worktree git dir");
+        fs::write(wt_git.join("HEAD"), format!("ref: refs/heads/{branch}\n")).expect("HEAD");
+        fs::write(wt_git.join("commondir"), "../..\n").expect("commondir");
+        let work = scratch.path().join(name);
+        fs::create_dir_all(&work).expect("work dir");
+        fs::write(work.join(".git"), format!("gitdir: {}\n", wt_git.display())).expect(".git file");
+        work
+    };
+    let develop = worktree("w", "develop");
+    let feature = worktree("w2", "feature");
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&develop), &envs, Duration::from_secs(2));
+    assert!(!line.contains("\u{1b}]8;;"), "no link on develop: {line:?}");
+    assert_eq!(gh_calls(scratch.path()), "");
+
+    let line = render_until_pr(&payload(&feature), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "the feature worktree's PR: {line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(calls.contains("--head feature "), "{calls:?}");
+}
+
+#[test]
+fn a_pr_from_someone_elses_branch_of_the_same_name_is_passed_over() {
+    // `--head` matches the branch name alone, so a fork's `fix-ci` and ours
+    // come back in one list. Only the one whose head lives on our origin is
+    // this branch's PR.
+    let scratch = Scratch::new("owner");
+    let work = plant_checkout(
+        scratch.path(),
+        "fix-ci",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let both = r#"[{"number":900,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/900","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"someone-else"}},{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"Kinisi-Robotics"}}]"#;
+    let bin = plant_gh(scratch.path(), both, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "our PR, not the fork's: {line:?}");
+    assert!(!line.contains("/pull/900"), "{line:?}");
+}
+
+#[test]
+fn a_fork_asks_upstream_about_the_branch_it_pushed_to() {
+    // A fork clone: origin is the fork, the PR lives on upstream, and with
+    // `push.default = upstream` the local branch pushes to the branch it
+    // merges from, which has another name.
+    let scratch = Scratch::new("fork");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "local-name",
+        "[remote \"origin\"]\n\turl = git@github.com:blooop/kinisi_ros.git\n\
+         [remote \"upstream\"]\n\turl = https://github.com/kinisi-robotics/kinisi_ros.git\n\
+         [branch \"local-name\"]\n\tremote = origin\n\tmerge = refs/heads/pushed/name\n\
+         [push]\n\tdefault = upstream\n",
+    );
+    let from_fork = r#"[{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"blooop"}}]"#;
+    let bin = plant_gh(scratch.path(), from_fork, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "the upstream PR: {line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(
+        calls.contains("--repo kinisi-robotics/kinisi_ros --head pushed/name"),
+        "asked upstream about the pushed branch: {calls:?}"
+    );
+}
+
+#[test]
+fn a_stacked_branch_asks_about_itself_not_the_branch_it_was_cut_from() {
+    // `git checkout -b my-fix origin/base-feature` records base-feature as the
+    // upstream. That is where the branch pulls from; under the default
+    // `push.default` it still pushes to `my-fix`, and that is its PR's head.
+    let scratch = Scratch::new("stacked");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "my-fix",
+        "[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n\
+         [branch \"my-fix\"]\n\tremote = origin\n\tmerge = refs/heads/base-feature\n",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "{line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(calls.contains("--head my-fix "), "{calls:?}");
+    assert!(!calls.contains("base-feature"), "{calls:?}");
+}
+
+#[test]
+fn a_branch_cut_from_main_is_still_asked_about() {
+    // `git checkout -b feat origin/main` tracks main. The default branch is
+    // nobody's head, but `feat` is, and it pushes to `feat`.
+    let scratch = Scratch::new("from-main");
+    let work = plant_checkout_with(
+        scratch.path(),
+        "feat",
+        "[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n\
+         [branch \"feat\"]\n\tremote = origin\n\tmerge = refs/heads/main\n",
+    );
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "{line:?}");
+    let calls = gh_calls(scratch.path());
+    assert!(calls.contains("--head feat "), "{calls:?}");
+}
+
+/// A checkout that fetches from origin but pushes to a `fork` remote.
+fn plant_push_remote_checkout(root: &Path) -> PathBuf {
+    plant_checkout_with(
+        root,
+        "fix-ci",
+        "[remote \"origin\"]\n\turl = git@github.com:kinisi-robotics/kinisi_ros.git\n\
+         [remote \"fork\"]\n\turl = git@github.com:blooop/kinisi_ros.git\n\
+         [branch \"fix-ci\"]\n\tremote = origin\n\tpushRemote = fork\n\tmerge = refs/heads/fix-ci\n",
+    )
+}
+
+#[test]
+fn a_push_remote_names_the_head_owner() {
+    // The triangular workflow: fetch from origin, push to a fork. The PR's head
+    // is on the fork, so its owner is the one that counts.
+    let scratch = Scratch::new("push-remote");
+    let work = plant_push_remote_checkout(scratch.path());
+    let from_fork = r#"[{"number":11573,"url":"https://github.com/kinisi-robotics/kinisi_ros/pull/11573","state":"OPEN","isDraft":false,"headRepositoryOwner":{"login":"blooop"}}]"#;
+    let bin = plant_gh(scratch.path(), from_fork, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(10));
+    assert!(line.contains(PR_URL), "the fork's PR: {line:?}");
+}
+
+#[test]
+fn a_push_remote_passes_over_the_fetch_remotes_pr() {
+    let scratch = Scratch::new("push-remote-miss");
+    let work = plant_push_remote_checkout(scratch.path());
+    let bin = plant_gh(scratch.path(), GH_ONE_OPEN_PR, 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+
+    let line = render_until_pr(&payload(&work), &envs, Duration::from_secs(3));
+    assert!(
+        !line.contains("\u{1b}]8;;"),
+        "origin's head is not ours: {line:?}"
+    );
+    assert_eq!(fs::read_to_string(cache_entry(&cache)).unwrap(), "null");
+}
+
+#[test]
+fn the_pr_claude_code_sends_is_shown_without_asking_gh() {
+    // Claude Code puts its own lookup in the payload. It already knows the
+    // base repo and the head owner, so when it is there it wins, and the
+    // render costs no refresh at all.
+    let scratch = Scratch::new("payload");
+    let work = plant_checkout(
+        scratch.path(),
+        "ags/build_summary_mins",
+        "git@github.com:kinisi-robotics/kinisi_ros.git",
+    );
+    let bin = plant_gh(scratch.path(), "[]", 0);
+    let cache = scratch.path().join("cache");
+    let envs = [
+        ("PATH", bin.to_str().unwrap()),
+        ("CLAUDE_STATUSLINE_CACHE", cache.to_str().unwrap()),
+    ];
+    let input = format!(
+        r#"{{"model":{{"display_name":"Opus 5"}},"workspace":{{"current_dir":"{}"}},"pr":{{"number":11573,"url":"{PR_URL}","review_state":"draft"}}}}"#,
+        work.display()
+    );
+
+    let out = run_binary_env(input.as_bytes(), &envs);
+    let text = visible(&String::from_utf8_lossy(&out.stdout));
+    assert!(
+        text.contains(&format!("○ {PR_URL}")),
+        "a draft, linked: {text:?}"
+    );
+    // The refresh lock is taken before the child is spawned, so no cache
+    // directory means no refresh was ever started.
+    assert!(
+        !cache.join("claude-statusline").exists(),
+        "no refresh started"
+    );
+    assert_eq!(gh_calls(scratch.path()), "", "gh never asked");
 }
